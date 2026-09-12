@@ -1,0 +1,54 @@
+name: Squash Git History
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["report data content"]
+    types:
+      - completed
+
+permissions:
+  contents: write
+
+jobs:
+  squash_history_only:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Squash history into one commit (server-side, zero upload)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          api() {
+            curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+                 -H "Accept: application/vnd.github+json" \
+                 -H "X-GitHub-Api-Version: 2022-11-28" "$@"
+          }
+
+          # current head commit and its tree (tree = ALL current files, already on server)
+          HEAD_SHA=$(api "https://api.github.com/repos/$REPO/git/ref/heads/main" | jq -r .object.sha)
+          [ -n "$HEAD_SHA" ] && [ "$HEAD_SHA" != "null" ] || { echo "Could not read main ref"; exit 1; }
+          COMMIT_JSON=$(api "https://api.github.com/repos/$REPO/git/commits/$HEAD_SHA")
+          TREE_SHA=$(echo "$COMMIT_JSON" | jq -r .tree.sha)
+          PARENT_COUNT=$(echo "$COMMIT_JSON" | jq '.parents | length')
+          echo "HEAD: $HEAD_SHA  TREE: $TREE_SHA  parents: $PARENT_COUNT"
+
+          if [ "$PARENT_COUNT" -eq 0 ]; then
+            echo "History is already a single commit - nothing to do"
+            exit 0
+          fi
+
+          # create a new ROOT commit pointing at the same tree (keeps every file, uploads nothing)
+          NEW_SHA=$(api -X POST "https://api.github.com/repos/$REPO/git/commits" \
+            -d "{\"message\":\"Data snapshot hyperliquid ($(date -u +%Y-%m-%d))\",\"tree\":\"$TREE_SHA\",\"parents\":[]}" \
+            | jq -r .sha)
+          echo "New snapshot commit: $NEW_SHA"
+          [ -n "$NEW_SHA" ] && [ "$NEW_SHA" != "null" ] || { echo "Failed to create commit"; exit 1; }
+
+          # force-move main to the snapshot commit
+          RESULT=$(api -X PATCH "https://api.github.com/repos/$REPO/git/refs/heads/main" \
+            -d "{\"sha\":\"$NEW_SHA\",\"force\":true}")
+          echo "$RESULT" | jq -e --arg s "$NEW_SHA" '.object.sha == $s' > /dev/null \
+            && echo "Done: main now has a single snapshot commit" \
+            || { echo "Ref update failed: $RESULT"; exit 1; }
